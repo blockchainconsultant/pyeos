@@ -1,3 +1,13 @@
+.cproject
+.project
+.pydevproject
+.settings
+Debug
+libraries/.cproject
+libraries/.project
+libraries/.pydevproject
+libraries/.settings
+*.wrap.cpp
 *.a
 *.sw*
 *.dylib
