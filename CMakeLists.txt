@@ -2,6 +2,8 @@
 project( EOS )
 cmake_minimum_required( VERSION 2.8.12 )
 
+enable_testing()
+
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/libraries/fc/CMakeModules")
 
 INCLUDE( VersionMacros )
@@ -10,9 +12,9 @@ INCLUDE( SetupTargetMacros )
 set( BLOCKCHAIN_NAME "Eos" )
 set( CMAKE_CXX_STANDARD 14 )
 
-set(VERSION_MAJOR 1)
+set(VERSION_MAJOR 2)
 set(VERSION_MINOR 1)
-set(VERSION_PATCH 0)
+set(VERSION_PATCH 1)
 
 set( CLI_CLIENT_EXECUTABLE_NAME eos_client )
 set( GUI_CLIENT_EXECUTABLE_NAME eos )
@@ -34,6 +36,7 @@ list( APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules" )
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS "ON")
 set(BUILD_DOXYGEN FALSE CACHE BOOL "Build doxygen documentation on every make")
+set(BUILD_MONGO_DB_PLUGIN FALSE CACHE BOOL "Build mongo database plugin")
 set(EOS_EGENESIS_JSON "${CMAKE_CURRENT_SOURCE_DIR}/genesis.json" )
 
 #set (ENABLE_INSTALLER 1)
@@ -58,6 +61,19 @@ LIST(APPEND BOOST_COMPONENTS thread
                              context
                              locale)
 SET( Boost_USE_STATIC_LIBS ON CACHE STRING "ON or OFF" )
+
+if(UNIX)
+  if(APPLE)
+    set(whole_archive_flag "-force_load")
+    set(no_whole_archive_flag "")
+  else()
+    set(whole_archive_flag "--whole-archive")
+    set(no_whole_archive_flag "--no-whole-archive")
+  endif()
+else()
+  set(whole_archive_flag "--whole-archive")
+  set(no_whole_archive_flag "--no-whole-archive")
+endif()
 
 IF( WIN32 )
   SET(BOOST_ROOT $ENV{BOOST_ROOT})
@@ -177,8 +193,9 @@ else()
 endif()
 
 add_subdirectory( libraries )
-add_subdirectory( programs )
 add_subdirectory( plugins )
+add_subdirectory( programs )
+add_subdirectory( scripts )
 add_subdirectory( tests )
 add_subdirectory( tools )
 
@@ -230,16 +247,13 @@ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/genesis.json ${CMAKE_CURRENT_BINARY_D
 
 include(FindDoxygen)
 
-
-
 if(NOT DOXYGEN_FOUND)
   message(STATUS "Doxygen not found.  Contract documentation will not be generated.")
 else()
-  message(STATUS "Doxygen found.  Contract documentation will be generated.")
   set(DOXY_EOS_VERSION "${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}" CACHE INTERNAL "Version string used in PROJECT_NUMBER.")
   # CMake strips trailing path separators off of variables it knows are paths,
   # so the trailing '/' Doxygen expects is embedded in the doxyfile.
-  set(DOXY_DOC_DEST_DIR "${CMAKE_BINARY_DIR}/docs/html" CACHE PATH "Path to the doxygen output")
+  set(DOXY_DOC_DEST_DIR "${CMAKE_BINARY_DIR}/docs" CACHE PATH "Path to the doxygen output")
   set(DOXY_DOC_INPUT_ROOT_DIR "contracts" CACHE PATH "Path to the doxygen input")
   if(DOXYGEN_DOT_FOUND)
     set(DOXY_HAVE_DOT "YES" CACHE STRING "Doxygen to use dot for diagrams.")
@@ -248,15 +262,14 @@ else()
   endif(DOXYGEN_DOT_FOUND)
   configure_file("eos.doxygen.in" "${CMAKE_BINARY_DIR}/eos.doxygen")
   if(BUILD_DOXYGEN) 
-     # !! Core developers who don't want to see the doxygen output on every build
-     # !! should remove the 'ALL' option from both commands below.
-     # Doxygen has issues making destination directories more than one level deep, so do it for it.
-     add_custom_target(make_doc_dir ALL COMMAND ${CMAKE_COMMAND} -E make_directory "${DOXY_DOC_DEST_DIR}")
-     add_custom_target(contract_documentation ALL
-         COMMAND "${DOXYGEN_EXECUTABLE}" "${CMAKE_BINARY_DIR}/eos.doxygen"
-         DEPENDS make_doc_dir
-         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-         COMMENT "Building doxygen documentation into ${DOXY_DOC_DEST_DIR}..."
-         VERBATIM)
+    message(STATUS "Doxygen found.  Contract documentation will be generated.")
+    # Doxygen has issues making destination directories more than one level deep, so do it for it.
+    add_custom_target(make_doc_dir ALL COMMAND ${CMAKE_COMMAND} -E make_directory "${DOXY_DOC_DEST_DIR}")
+    add_custom_target(contract_documentation ALL
+      COMMAND "${DOXYGEN_EXECUTABLE}" "${CMAKE_BINARY_DIR}/eos.doxygen"
+      DEPENDS make_doc_dir
+      WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+      COMMENT "Building doxygen documentation into ${DOXY_DOC_DEST_DIR}..."
+      VERBATIM)
   endif(BUILD_DOXYGEN)
 endif()

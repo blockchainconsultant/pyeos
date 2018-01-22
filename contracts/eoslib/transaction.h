@@ -52,14 +52,12 @@ extern "C" {
     */
 
    /** 
-    * @defgroup transactioncapi transaction C API
+    * @defgroup transactioncapi Transaction C API
     * @ingroup transactionapi
     * @brief Define API for sending transactions 
     *
     * @{
     */
-
-   void send_inline(char *serialized_action, size_t size);
 
    void send_deferred(uint32_t sender_id, time delay_until, char *serialized_transaction, size_t size);
 

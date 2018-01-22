@@ -7,6 +7,8 @@
 #pragma once
 #include <eoslib/math.hpp>
 #include <eoslib/print.hpp>
+#include <eoslib/reflect.hpp>
+#include <eoslib/asset.hpp>
 
 
 namespace eosio {
@@ -18,57 +20,29 @@ namespace eosio {
   * @{
   */
 
-  /**
-  *
-  *  @brief a uint64_t wrapper with checks for proper types and over/underflows.
-  *  @tparam NumberType - numeric type of the token
-  *  @tparam currency - type of the currency (e.g. eos) represented as an unsigned 64 bit integer
-  *  @ingroup tokens
-  *
-  *  @details Base token structure with checks for proper types and over/underflows.
-  *  It supports the following operator: +=, -=, +, -, <=, <, ==, !=, >=, >, bool and also print functionality
-  *
-  *  Example:
-  *  @code
-  *  typedef eosio::token<uint32_t, N(MyToken)> MyToken;
-  *  MyToken  a(128);
-  *  a.print(); // Output: 128 MyToken
-  *  MyToken b(64);
-  *  a += b;
-  *  a.print(); // Output: 192 MyToken
-  *  b.print(); // Output:  64 MyToken
-  *  a -= b;
-  *  a.print(); // Output: 128 MyToken
-  *  b.print(); // Output:  64 MyToken
-  *  b -= a;    // Throws integer underflow exception
-  *  MyToken c = a + b;
-  *  c.print(); // Output: 192 MyToken
-  *  MyToken d = a - b;
-  *  d.print(); // Output: 64 MyToken
-  *  MyToken maxToken(std::numeric_limits<uint32_t>::max());
-  *  maxToken += b; // Throws integer overflow exception
-  *  std::cout << (maxToken > b); // Output: true
-  *  std::cout << (b > maxToken); // Output: false
-  *  std::cout << (bool)maxToken; // Output: true
-  *  std::cout << (a == b);  // Output: false
-  *  std::cout << (a != b);  // Output: true
-  *  @endcode
-  *
-  *  @{
-  */
-  template<typename NumberType, uint64_t currency = N(eos) >
+  template< uint64_t Code,
+            uint64_t Symbol,
+            typename NumberType = uint64_t 
+              >
   struct token {
     /**
     * Type of the currency (e.g. eos) represented as an unsigned 64 bit integer
     * @brief  Type of the currency
     */
-    static const uint64_t currency_type = currency;
+    static const uint64_t code   = Code;
+    static const uint64_t symbol = Symbol;
 
     /**
     * Default constructor
     * @brief Default constructor
     */
     token(){}
+
+    operator asset()const { return asset( quantity, Symbol ); }
+
+    token( const asset& a ):quantity(a.amount) {
+       assert( a.symbol == Symbol, "attempt to construct token from asset with different symbol" );
+    }
 
     /**
     * Constructor for token given quantity of tokens available
@@ -197,15 +171,26 @@ namespace eosio {
     */
     explicit operator bool()const { return quantity != 0; }
 
-    /**
-    * Print as string representation of the token (e.g. 1 EOS)
-    * @brief Print as string
-    */
-    inline void print() {
-      eosio::print( quantity, " ", name(currency_type) );
+    template<typename DataStream>
+    friend DataStream& operator << ( DataStream& ds, const token& t ){
+       return ds << t.quantity;
     }
+    template<typename DataStream>
+    friend DataStream& operator >> ( DataStream& ds, token& t ){
+       return ds >> t.quantity;
+    }
+
   };
   /// @}
+
+
+  template<typename BaseToken, typename QuoteToken>
+  struct price_ratio {
+     BaseToken   base;
+     QuoteToken  quote;
+  };
+
+  
 
   /**
   *
@@ -289,7 +274,6 @@ namespace eosio {
     * @return quote token
     */
     friend QuoteToken operator / ( BaseToken b, const price& q ) {
-      eosio::print( "operator/ ", uint128(b.quantity), " * ", uint128( precision ), " / ", q.base_per_quote, "\n" );
       return QuoteToken( uint64_t((uint128(b.quantity) * uint128(precision)   / q.base_per_quote)) );
     }
 
@@ -301,8 +285,6 @@ namespace eosio {
     * @return base token
     */
     friend BaseToken operator * ( const QuoteToken& b, const price& q ) {
-      eosio::print( "b: ", b, " \n" );
-      eosio::print( "operator* ", uint128(b.quantity), " * ", uint128( q.base_per_quote ), " / ", precision, "\n" );
       //return QuoteToken( uint64_t( mult_div_i128( b.quantity, q.base_per_quote, precision ) ) );
       return BaseToken( uint64_t((b.quantity * q.base_per_quote) / precision) );
     }
@@ -361,13 +343,6 @@ namespace eosio {
     */
     friend bool operator != ( const price& a, const price& b ) { return a.base_per_quote != b.base_per_quote; }
 
-    /**
-    * Prints as string representing the conversion.
-    * @brief Prints as string.
-    */
-    inline void print() {
-      eosio::print( base_per_quote, ".", " ", name(base_token_type::currency_type), "/", name(quote_token_type::currency_type)  );
-    }
   private:
     /**
     * Represents as number of base tokens to purchase 1 quote token.
@@ -378,58 +353,11 @@ namespace eosio {
 
   /// @}
 
-  /**
-  * @typedef tokens
-  * @brief Defines eos tokens
-  * @details Defines eos tokens
-  */
-  typedef eosio::token<uint64_t,N(eos)>   tokens;
-
-  /**
-  *  @struct eosio::transfer
-  *  @brief The binary structure of the `transfer` message type for the `eos` contract.
-  *  @ingroup tokens
-  *
-  *  @details
-  *  Example:
-  *  @code
-  *  transfer MeToYou;
-  *  MeToYou.from = N(Me);
-  *  MeToYou.to = N(You);
-  *  MeToYou.quantity = tokens(100);
-  *  @endcode
-  *  @{
-  */
-  struct PACKED (transfer) {
-    /**
-    * Defines transfer action type
-    * @brief Defines transfer action type
-    */
-    static const uint64_t action_type = N(transfer);
-
-    /**
-    * Name of the account who sends the token
-    * @brief Name of the account who sends the token
-    */
-    account_name  from;
-    /**
-    * Name of the account who receives the token
-    * @brief Name of the account who receives the token
-    */
-    account_name  to;
-    /**
-    * Quantity of token to be transferred
-    * @brief Quantity of token to be transferred
-    */
-    tokens        quantity;
-
-    /**
-    * Length of the memo field, included for binary compatibility
-    * @brief Length of the memo field
-    */
-    const uint8_t memo_length = 0;
-  };
-  /// @}
 
   /// @} tokenhppapi
+
+
+
+
 }
+

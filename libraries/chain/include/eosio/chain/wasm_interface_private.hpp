@@ -17,15 +17,23 @@ using wasm_double = boost::multiprecision::cpp_dec_float_50;
 
 struct wasm_cache::entry {
    entry(ModuleInstance *instance, Module *module)
-      : instance(instance), module(module) {}
+      : instance(instance), module(module) 
+   {
+   }
 
-   ModuleInstance *instance;
-   Module *module;
+   ModuleInstance* instance;
+   Module* module;
 };
 
 struct wasm_context {
-   wasm_cache::entry &code;
-   apply_context &context;
+   wasm_context(wasm_cache::entry &code, apply_context& ctx) : code(code), context(ctx)
+   {
+      //initialize to minimum bytes and limit this to 32 bit space
+      sbrk_bytes = (1 << IR::numBytesPerPageLog2) > UINT32_MAX ? UINT32_MAX : 1 << IR::numBytesPerPageLog2;
+   }
+   wasm_cache::entry& code;
+   apply_context& context;
+   uint32_t sbrk_bytes;
 };
 
 struct wasm_interface_impl {
@@ -90,6 +98,26 @@ struct array_ptr {
    T *value;
 };
 
+/**
+ * class to represent an in-wasm-memory char array that must be null terminated
+ */
+struct null_terminated_ptr {
+   typename std::add_lvalue_reference<char>::type operator*() const {
+      return *value;
+   }
+
+   char *operator->() const noexcept {
+      return value;
+   }
+
+   template<typename U>
+   operator U *() const {
+      return static_cast<U *>(value);
+   }
+
+   char *value;
+};
+
 
 /**
  * template that maps native types to WASM VM types
@@ -101,7 +129,7 @@ struct native_to_wasm {
 };
 
 /**
- * specialization for maping pointers to int32's
+ * specialization for mapping pointers to int32's
  */
 template<typename T>
 struct native_to_wasm<T *> {
@@ -172,7 +200,12 @@ auto convert_native_to_wasm(const wasm_interface &wasm, const fc::time_point_sec
 
 auto convert_native_to_wasm(wasm_interface &wasm, char* ptr) {
    auto mem = getDefaultMemory(intrinsics_accessor::get_context(wasm).code.instance);
-   char* base = &memoryRef<char>(mem, 0);
+   if(!mem)
+      Runtime::causeException(Exception::Cause::accessViolation);
+   char* base = (char*)getMemoryBaseAddress(mem);
+   char* top_of_memory = base + IR::numBytesPerPage*Runtime::getMemoryNumPages(mem);
+   if(ptr < base || ptr >= top_of_memory)
+      Runtime::causeException(Exception::Cause::accessViolation);
    return (int)(ptr - base);
 }
 
@@ -278,7 +311,7 @@ struct wasm_function_type_provider<Ret(Args...)> {
 };
 
 /**
- * Forward delclaration of the invoker type which transcribes arguments to/from a native method
+ * Forward declaration of the invoker type which transcribes arguments to/from a native method
  * and injects the appropriate checks
  *
  * @tparam Ret - the return type of the native function
@@ -289,7 +322,7 @@ template<typename Ret, typename NativeParameters, typename WasmParameters>
 struct intrinsic_invoker_impl;
 
 /**
- * specialization fo the fully transcribed signature
+ * Specialization for the fully transcribed signature
  * @tparam Ret - the return type of the native function
  * @tparam Translated - the arguments to the wasm function
  */
@@ -372,8 +405,44 @@ struct intrinsic_invoker_impl<Ret, std::tuple<array_ptr<T>, size_t, Inputs...>, 
    static Ret translate_one(wasm_interface &wasm, Inputs... rest, Translated... translated, I32 ptr, I32 size) {
       auto mem = getDefaultMemory(intrinsics_accessor::get_context(wasm).code.instance);
       size_t length = size_t(size);
-      T *base = memoryArrayPtr<T>(mem, ptr, length);
+      if(!mem || ptr+sizeof(T)*length >= IR::numBytesPerPage*Runtime::getMemoryNumPages(mem))
+         Runtime::causeException(Exception::Cause::accessViolation);
+      T *base = (T*)(getMemoryBaseAddress(mem)+ptr);
       return Then(wasm, array_ptr<T>{base}, length, rest..., translated...);
+   };
+
+   template<then_type Then>
+   static const auto fn() {
+      return next_step::template fn<translate_one<Then>>();
+   }
+};
+
+/**
+ * Specialization for transcribing  a null_terminated_ptr type in the native method signature
+ * This type transcribes 1 wasm parameters: a char pointer which is validated to contain
+ * a null value before the end of the allocated memory.
+ *
+ * @tparam Ret - the return type of the native method
+ * @tparam Inputs - the remaining native parameters to transcribe
+ * @tparam Translated - the list of transcribed wasm parameters
+ */
+template<typename Ret, typename... Inputs, typename ...Translated>
+struct intrinsic_invoker_impl<Ret, std::tuple<null_terminated_ptr, Inputs...>, std::tuple<Translated...>> {
+   using next_step = intrinsic_invoker_impl<Ret, std::tuple<Inputs...>, std::tuple<Translated..., I32>>;
+   using then_type = Ret(*)(wasm_interface &, null_terminated_ptr, Inputs..., Translated...);
+
+   template<then_type Then>
+   static Ret translate_one(wasm_interface &wasm, Inputs... rest, Translated... translated, I32 ptr) {
+      auto mem = getDefaultMemory(intrinsics_accessor::get_context(wasm).code.instance);
+      if(!mem)
+         Runtime::causeException(Exception::Cause::accessViolation);
+      char *base          = (char*)(getMemoryBaseAddress(mem) + ptr);
+      char *p             = base;
+      char *top_of_memory = (char*)(getMemoryBaseAddress(mem) + IR::numBytesPerPage*Runtime::getMemoryNumPages(mem));
+      while(p < top_of_memory)
+         if(*p++ == '\0')
+            return Then(wasm, null_terminated_ptr{base}, rest..., translated...);
+      Runtime::causeException(Exception::Cause::accessViolation);
    };
 
    template<then_type Then>
@@ -400,8 +469,11 @@ struct intrinsic_invoker_impl<Ret, std::tuple<array_ptr<T>, array_ptr<U>, size_t
    static Ret translate_one(wasm_interface &wasm, Inputs... rest, Translated... translated, I32 ptr_t, I32 ptr_u, I32 size) {
       auto mem = getDefaultMemory(intrinsics_accessor::get_context(wasm).code.instance);
       size_t length = size_t(size);
-      T *base_t = memoryArrayPtr<T>(mem, ptr_t, length);
-      U *base_u = memoryArrayPtr<U>(mem, ptr_u, length);
+      if(!mem || ptr_t+sizeof(T)*length >= IR::numBytesPerPage*Runtime::getMemoryNumPages(mem)
+              || ptr_u+sizeof(U)*length >= IR::numBytesPerPage*Runtime::getMemoryNumPages(mem))
+         Runtime::causeException(Exception::Cause::accessViolation);
+      T *base_t = (T*)(getMemoryBaseAddress(mem)+ptr_t);
+      U *base_u = (U*)(getMemoryBaseAddress(mem)+ptr_u);
       return Then(wasm, array_ptr<T>{base_t}, array_ptr<U>{base_u}, length, rest..., translated...);
    };
 
@@ -418,16 +490,18 @@ struct intrinsic_invoker_impl<Ret, std::tuple<array_ptr<T>, array_ptr<U>, size_t
  * @tparam Inputs - the remaining native parameters to transcribe
  * @tparam Translated - the list of transcribed wasm parameters
  */
-template<>
-struct intrinsic_invoker_impl<void_type, std::tuple<array_ptr<char>, int, size_t>, std::tuple<>> {
-   using next_step = intrinsic_invoker_impl<void_type, std::tuple<>, std::tuple<I32, I32, I32>>;
-   using then_type = void_type(*)(wasm_interface &, array_ptr<char>, int, size_t);
+template<typename Ret>
+struct intrinsic_invoker_impl<Ret, std::tuple<array_ptr<char>, int, size_t>, std::tuple<>> {
+   using next_step = intrinsic_invoker_impl<Ret, std::tuple<>, std::tuple<I32, I32, I32>>;
+   using then_type = Ret(*)(wasm_interface &, array_ptr<char>, int, size_t);
 
    template<then_type Then>
-   static void_type translate_one(wasm_interface &wasm, I32 ptr, I32 value, I32 size) {
+   static Ret translate_one(wasm_interface &wasm, I32 ptr, I32 value, I32 size) {
       auto mem = getDefaultMemory(intrinsics_accessor::get_context(wasm).code.instance);
       size_t length = size_t(size);
-      char *base = memoryArrayPtr<char>(mem, ptr, length);
+      if(!mem || ptr+sizeof(char)*length >= IR::numBytesPerPage*Runtime::getMemoryNumPages(mem))
+         Runtime::causeException(Exception::Cause::accessViolation);
+      char *base = (char*)(getMemoryBaseAddress(mem)+ptr);
       return Then(wasm, array_ptr<char>{base}, value, length);
    };
 
@@ -454,7 +528,9 @@ struct intrinsic_invoker_impl<Ret, std::tuple<T *, Inputs...>, std::tuple<Transl
    template<then_type Then>
    static Ret translate_one(wasm_interface &wasm, Inputs... rest, Translated... translated, I32 ptr) {
       auto mem = getDefaultMemory(intrinsics_accessor::get_context(wasm).code.instance);
-      T *base = memoryArrayPtr<T>(mem, ptr, 1);
+      if(!mem || ptr+sizeof(T) >= IR::numBytesPerPage*Runtime::getMemoryNumPages(mem))
+         Runtime::causeException(Exception::Cause::accessViolation);
+      T *base = (T*)(getMemoryBaseAddress(mem)+ptr);
       return Then(wasm, base, rest..., translated...);
    };
 
@@ -536,7 +612,9 @@ struct intrinsic_invoker_impl<Ret, std::tuple<T &, Inputs...>, std::tuple<Transl
       // references cannot be created for null pointers
       FC_ASSERT(ptr != 0);
       auto mem = getDefaultMemory(intrinsics_accessor::get_context(wasm).code.instance);
-      T &base = memoryRef<T>(mem, ptr);
+      if(!mem || ptr+sizeof(T) >= IR::numBytesPerPage*Runtime::getMemoryNumPages(mem))
+         Runtime::causeException(Exception::Cause::accessViolation);
+      T &base = *(T*)(getMemoryBaseAddress(mem)+ptr);
       return Then(wasm, base, rest..., translated...);
    }
 

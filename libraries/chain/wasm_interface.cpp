@@ -220,7 +220,7 @@ namespace eosio { namespace chain {
                // time to compile a brand new (maybe first) copy of this code
                Module* module = new Module();
                ModuleInstance* instance = nullptr;
-               size_t mem_end;
+               size_t mem_end = 0;
                vector<char> mem_image;
 
                try {
@@ -233,18 +233,19 @@ namespace eosio { namespace chain {
                   instance = instantiateModule(*module, std::move(link_result.resolvedImports));
                   FC_ASSERT(instance != nullptr);
 
-                  auto current_memory = Runtime::getDefaultMemory(instance);
+                  MemoryInstance* current_memory = Runtime::getDefaultMemory(instance);
 
-                  char *mem_ptr = &memoryRef<char>(current_memory, 0);
-                  const auto allocated_memory = Runtime::getDefaultMemorySize(instance);
-                  for (uint64_t i = 0; i < allocated_memory; ++i) {
-                     if (mem_ptr[i]) {
-                        mem_end = i + 1;
+                  if(current_memory) {
+                     char *mem_ptr = &memoryRef<char>(current_memory, 0);
+                     const auto allocated_memory = Runtime::getDefaultMemorySize(instance);
+                     for (uint64_t i = 0; i < allocated_memory; ++i) {
+                        if (mem_ptr[i])
+                           mem_end = i + 1;
                      }
+                     mem_image.resize(mem_end);
+                     memcpy(mem_image.data(), mem_ptr, mem_end);
                   }
-
-                  mem_image.resize(mem_end);
-                  memcpy(mem_image.data(), mem_ptr, mem_end);
+                  
                } catch (...) {
                   pending_error = std::current_exception();
                }
@@ -302,9 +303,12 @@ namespace eosio { namespace chain {
          _ios.post([&,code_id,this](){
             // sanitize by reseting the memory that may now be dirty
             auto& info = (*fetch_info(code_id)).get();
-            char* memstart = &memoryRef<char>( getDefaultMemory(entry.instance), 0 );
-            memset( memstart + info.mem_end, 0, ((1<<16) - info.mem_end) );
-            memcpy( memstart, info.mem_image.data(), info.mem_end);
+            if(getDefaultMemory(entry.instance)) {
+               char* memstart = &memoryRef<char>( getDefaultMemory(entry.instance), 0 );
+               memset( memstart + info.mem_end, 0, ((1<<16) - info.mem_end) );
+               memcpy( memstart, info.mem_image.data(), info.mem_end);
+            }
+            resetGlobalInstances(entry.instance);
 
             // under a lock, put this entry back in the available instances side of the instances vector
             with_lock([&,this](){
@@ -342,18 +346,19 @@ namespace eosio { namespace chain {
    wasm_cache::~wasm_cache() = default;
 
    wasm_cache::entry &wasm_cache::checkout( const digest_type& code_id, const char* wasm_binary, size_t wasm_binary_size ) {
-      // see if there is an avaialble entry in the cache
+      // see if there is an available entry in the cache
       auto result = _my->try_fetch_entry(code_id);
-
       if (result) {
          return (*result).get();
       }
-
       return _my->fetch_entry(code_id, wasm_binary, wasm_binary_size);
    }
 
 
    void wasm_cache::checkin(const digest_type& code_id, entry& code ) {
+      MemoryInstance* default_mem = Runtime::getDefaultMemory(code.instance);
+      if(default_mem)
+         Runtime::shrinkMemory(default_mem, Runtime::getMemoryNumPages(default_mem) - 1);
       _my->return_entry(code_id, code);
    }
 
@@ -385,6 +390,7 @@ namespace eosio { namespace chain {
       FC_ASSERT( getFunctionType(call)->parameters.size() == args.size() );
 
       auto context_guard = scoped_context(current_context, code, context);
+      runInstanceStartFunc(code.instance);
       Runtime::invokeFunction(call,args);
    } catch( const Runtime::Exception& e ) {
       FC_THROW_EXCEPTION(wasm_execution_error,
@@ -406,10 +412,10 @@ namespace eosio { namespace chain {
    }
 
    void wasm_interface::apply( wasm_cache::entry& code, apply_context& context ) {
-      if (context.act.scope == config::system_account_name && context.act.name == N(setcode)) {
+      if (context.act.account == config::system_account_name && context.act.name == N(setcode)) {
          my->call("init", {}, code, context);
       } else {
-         vector<Value> args = {Value(uint64_t(context.act.scope)),
+         vector<Value> args = {Value(uint64_t(context.act.account)),
                                Value(uint64_t(context.act.name))};
          my->call("apply", args, code, context);
       }
@@ -622,18 +628,21 @@ DEFINE_INTRINSIC_FUNCTION0(env,checktime,checktime,none) {
 class context_aware_api {
    public:
       context_aware_api(wasm_interface& wasm)
-      :context(intrinsics_accessor::get_context(wasm).context)
+      :context(intrinsics_accessor::get_context(wasm).context), code(intrinsics_accessor::get_context(wasm).code),
+       sbrk_bytes(intrinsics_accessor::get_context(wasm).sbrk_bytes)
       {}
 
    protected:
-      apply_context& context;
+      uint32_t&          sbrk_bytes;
+      wasm_cache::entry& code;
+      apply_context&     context;
 };
 
 class system_api : public context_aware_api {
    public:
       using context_aware_api::context_aware_api;
 
-      void assert(bool condition, const char* str) {
+      void assert(bool condition, null_terminated_ptr str) {
          std::string message( str );
          if( !condition ) edump((message));
          FC_ASSERT( condition, "assertion failed: ${s}", ("s",message));
@@ -664,12 +673,12 @@ class action_api : public context_aware_api {
       }
 
       fc::time_point_sec publication_time() {
-         return context.published;
+         return context.trx_meta.published;
       }
 
       name current_sender() {
-         if (context.sender) {
-            return *context.sender;
+         if (context.trx_meta.sender) {
+            return *context.trx_meta.sender;
          } else {
             return name();
          }
@@ -680,8 +689,8 @@ class console_api : public context_aware_api {
    public:
       using context_aware_api::context_aware_api;
 
-      void prints(const char *str) {
-         context.console_append(str);
+      void prints(null_terminated_ptr str) {
+         context.console_append<const char*>(str);
       }
 
       void prints_l(array_ptr<const char> str, size_t str_len ) {
@@ -759,7 +768,7 @@ class db_index_api : public context_aware_api {
    int call(ContextMethodType method, const scope_name& scope, const account_name& code, const name& table, array_ptr<char> data, size_t data_len) {
       auto maybe_t_id = context.find_table(scope, context.receiver, table);
       if (maybe_t_id == nullptr) {
-         return 0;
+         return -1;
       }
 
       const auto& t_id = *maybe_t_id;
@@ -769,7 +778,11 @@ class db_index_api : public context_aware_api {
       char* record_data =  ((char*)data) + sizeof(KeyArrayType);
       size_t record_len = data_len - sizeof(KeyArrayType);
 
-      return (context.*(method))(t_id, keys, record_data, record_len) + sizeof(KeyArrayType);
+      auto res = (context.*(method))(t_id, keys, record_data, record_len);
+      if (res != -1) {
+         res += sizeof(KeyArrayType);
+      }
+      return res;
    }
 
    public:
@@ -807,10 +820,10 @@ class db_index_api : public context_aware_api {
 
 };
 
-class memory_api {
+class memory_api : public context_aware_api {
    public:
-      memory_api(wasm_interface&){}
-
+      using context_aware_api::context_aware_api;
+     
       char* memcpy( array_ptr<char> dest, array_ptr<const char> src, size_t length) {
          return (char *)::memcpy(dest, src, length);
       }
@@ -819,10 +832,43 @@ class memory_api {
          return ::memcmp(dest, src, length);
       }
 
-      void memset( array_ptr<char> dest, int value, size_t length ) {
-         ::memset(dest, value, length);
+      char* memset( array_ptr<char> dest, int value, size_t length ) {
+         return (char *)::memset( dest, value, length );
       }
 
+      uint32_t sbrk(int num_bytes) {
+         // TODO: omitted checktime function from previous version of sbrk, may need to be put back in at some point
+         constexpr uint32_t NBPPL2  = IR::numBytesPerPageLog2;
+         constexpr uint32_t MAX_MEM = 1024 * 1024;
+
+         MemoryInstance*  default_mem    = Runtime::getDefaultMemory(code.instance);
+         if(!default_mem)
+            throw eosio::chain::page_memory_error();
+
+         const uint32_t         num_pages      = Runtime::getMemoryNumPages(default_mem);
+         const uint32_t         min_bytes      = (num_pages << NBPPL2) > UINT32_MAX ? UINT32_MAX : num_pages << NBPPL2;
+         const uint32_t         prev_num_bytes = sbrk_bytes; //_num_bytes;
+         
+         // round the absolute value of num_bytes to an alignment boundary
+         num_bytes = (num_bytes + 7) & ~7;
+
+         if ((num_bytes > 0) && (prev_num_bytes > (MAX_MEM - num_bytes)))  // test if allocating too much memory (overflowed)
+            throw eosio::chain::page_memory_error();
+         else if ((num_bytes < 0) && (prev_num_bytes < (min_bytes - num_bytes))) // test for underflow
+            throw eosio::chain::page_memory_error(); 
+
+         // update the number of bytes allocated, and compute the number of pages needed
+         sbrk_bytes += num_bytes;
+         const uint32_t num_desired_pages = (sbrk_bytes + IR::numBytesPerPage - 1) >> NBPPL2;
+
+         // grow or shrink the memory to the desired number of pages
+         if (num_desired_pages > num_pages)
+            Runtime::growMemory(default_mem, num_desired_pages - num_pages);
+         else if (num_desired_pages < num_pages)
+            Runtime::shrinkMemory(default_mem, num_pages - num_desired_pages);
+
+         return prev_num_bytes;
+      }
 };
 
 class transaction_api : public context_aware_api {
@@ -869,8 +915,8 @@ REGISTER_INTRINSICS(action_api,
 );
 
 REGISTER_INTRINSICS(apply_context,
-   (require_write_scope,   void(int64_t)   )
-   (require_read_scope,    void(int64_t)   )
+   (require_write_lock,    void(int64_t)   )
+   (require_read_lock,     void(int64_t, int64_t)   )
    (require_recipient,     void(int64_t)   )
    (require_authorization, void(int64_t), "require_auth", void(apply_context::*)(const account_name&)const)
 );
@@ -885,15 +931,16 @@ REGISTER_INTRINSICS(console_api,
    (printhex,              void(int, int)  )
 );
 
-REGISTER_INTRINSICS(memory_api,
-   (memcpy,                 int(int, int, int)  )
-   (memcmp,                 int(int, int, int)  )
-   (memset,                void(int, int, int)  )
-);
-
 REGISTER_INTRINSICS(transaction_api,
    (send_inline,           void(int, int)  )
    (send_deferred,         void(int, int, int, int)  )
+);
+
+REGISTER_INTRINSICS(memory_api,
+   (memcpy,                 int(int, int, int)   )
+   (memcmp,                 int(int, int, int)   )
+   (memset,                 int(int, int, int)   )
+   (sbrk,                   int(int)             )
 );
 
 

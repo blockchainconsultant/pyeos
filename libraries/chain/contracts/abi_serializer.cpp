@@ -10,6 +10,7 @@
 #include <fc/io/raw.hpp>
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/multiprecision/cpp_int.hpp>
+#include <fc/io/varint.hpp>
 
 using namespace boost;
 
@@ -92,9 +93,9 @@ namespace eosio { namespace chain { namespace contracts {
       built_in_types.emplace("authority",                 pack_unpack<authority>());
       built_in_types.emplace("chain_config",              pack_unpack<chain_config>());
       built_in_types.emplace("type_def",                  pack_unpack<type_def>());
-      built_in_types.emplace("action",                    pack_unpack<action_def>());
-      built_in_types.emplace("table",                     pack_unpack<table_def>());
-      built_in_types.emplace("abi",                       pack_unpack<abi_def>());
+      built_in_types.emplace("action_def",                pack_unpack<action_def>());
+      built_in_types.emplace("table_def",                 pack_unpack<table_def>());
+      built_in_types.emplace("abi_def",                   pack_unpack<abi_def>());
       built_in_types.emplace("nonce",                     pack_unpack<nonce>());
    }
 
@@ -236,6 +237,16 @@ namespace eosio { namespace chain { namespace contracts {
       if( btype != built_in_types.end() ) {
          return btype->second.first(stream, is_array(rtype));
       }
+      if ( is_array(rtype) ) {
+        fc::unsigned_int size;
+        fc::raw::unpack(stream, size);
+        vector<fc::variant> vars;
+        vars.resize(size);
+        for (auto& var : vars) {
+           var = binary_to_variant(array_type(rtype), stream);
+        }
+        return fc::variant( std::move(vars) );
+      }
       
       fc::mutable_variant_object mvo;
       binary_to_variant(rtype, stream, mvo);
@@ -254,8 +265,13 @@ namespace eosio { namespace chain { namespace contracts {
       auto btype = built_in_types.find(array_type(rtype));
       if( btype != built_in_types.end() ) {
          btype->second.second(var, ds, is_array(rtype));
+      } else if ( is_array(rtype) ) {
+         vector<fc::variant> vars = var.get_array();
+         fc::raw::pack(ds, (fc::unsigned_int)vars.size());
+         for (const auto& var : vars) {
+           variant_to_binary(array_type(rtype), var, ds);
+         }
       } else {
-         
          const auto& st = get_struct(rtype);
          const auto& vo = var.get_object();
 
